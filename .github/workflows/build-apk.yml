@@ -36,6 +36,30 @@ jobs:
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
           "$SDKMANAGER" --install "platforms;android-37.0" "build-tools;37.0.0" "platform-tools"
 
+      # --------------------------------------------------------------------
+      # NEW: rebuild the core C binary from source.  The repo commits a
+      # prebuilt apk-gradle/app/src/main/assets/ic-timer (built on the
+      # author's machine); without this step, changes to core/anchors.h or
+      # core/profiles.h never reach the APK and every build keeps shipping
+      # the old offset tables ("缺少偏移" on builds that are not in them).
+      # r27c + API 29 is required: older NDK/API combos emit an underaligned
+      # TLS segment that the arm64 bionic linker refuses at exec time.
+      - name: Set up NDK r27c
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ndk.zip" \
+            https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+
+      - name: Build core ic-timer from source
+        run: |
+          chmod +x core/build.sh
+          CC="$RUNNER_TEMP/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang" \
+            core/build.sh "$RUNNER_TEMP/ic-timer" pd2571
+          cp "$RUNNER_TEMP/ic-timer" apk-gradle/app/src/main/assets/ic-timer
+          # fail the build early if the new table did not make it in
+          grep -q "ic_pd2456_161175_links" apk-gradle/app/src/main/assets/ic-timer
+      # --------------------------------------------------------------------
+
       # The repository keeps a local-only aapt2 path for the author's machine;
       # CI resolves aapt2 from Maven instead.
       - name: Drop local aapt2 override

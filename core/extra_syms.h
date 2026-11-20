@@ -50,6 +50,20 @@ static const struct ic_extra_syms ic_extra_syms_tab[] = {
      * boot fingerprint vivo/PD2425/PD2425 … compiler260917174806). */
     { "ic_pd2425_1611710_links", 0xffffffc00a1f11c8ULL, 0xffffffc00a1f2a78ULL,
       0xffffffc00a1f24e8ULL },
+
+    /* vivo T4 (PD2456IF / V2502) 16.1.17.5.W30, table's own kernel
+     * 6.1.145-android14-11-g74d1702dab4d-ab14669069.  Extracted from the
+     * kallsyms of a sibling Image (6.1.145-android14-11-g9b69cc399ae1-
+     * ab14819715) whose .data layout is identical to this build:
+     * runqueues, __tracepoint_sys_exit, selinux_state, init_user_ns,
+     * init_cred, module_notify_list and panic_on_warn all match the
+     * device's ic-syms.txt at the same addresses.  init_groups ends
+     * exactly at init_cred (sizeof(struct group_info) == 8), init_ucounts
+     * is 0x560 above init_cred.  On this build the ns-relative guesses
+     * (ns+0x298 / ns+0x1b48 / ns+0x15b8) are all wrong and ns+0x15b8
+     * aliases init_cred itself. */
+    { "ic_pd2456_161175_links", 0xffffffc00a020740ULL, 0xffffffc00a021fc8ULL,
+      0xffffffc00a021a60ULL },
 };
 
 #endif /* IC_EXTRA_SYMS_H */
